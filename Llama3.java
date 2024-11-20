@@ -3,6 +3,10 @@
 //PREVIEW
 //COMPILE_OPTIONS --add-modules=jdk.incubator.vector
 //RUNTIME_OPTIONS --add-modules=jdk.incubator.vector -Djdk.incubator.vector.VECTOR_ACCESS_OOB_CHECK=0
+//REPOS UniversityOfManchester-Graal=https://raw.githubusercontent.com/beehive-lab/tornado/maven-tornadovm
+//DEPS tornado:tornado-api:1.0.8
+//DEPS tornado:tornado-runtime:1.0.8
+//DEPS tornado:tornado-matrices:1.0.8
 //MAIN com.llama4j.Llama3
 
 // Practical Llama 3 (and 3.1) inference in a single Java file
@@ -50,6 +54,12 @@ import java.util.stream.Collectors;
 import java.util.stream.IntStream;
 import java.util.stream.LongStream;
 import java.util.stream.Stream;
+//import uk.ac.manchester.tornado.api.annotations.Parallel;
+import uk.ac.manchester.tornado.api.TaskGraph;
+import uk.ac.manchester.tornado.api.TornadoExecutionPlan;
+import uk.ac.manchester.tornado.api.enums.DataTransferMode;
+import uk.ac.manchester.tornado.api.exceptions.TornadoExecutionPlanException;
+import uk.ac.manchester.tornado.api.ImmutableTaskGraph;
 
 public class Llama3 {
     // Batch-size used in prompt evaluation.
@@ -956,45 +966,75 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
         out.mapWithIndexInPlace(0, size, (value, index) -> weight.get(index) * (finalss * x.getFloat(index)));
     }
 
+    // Replace the Llama.forward method with this optimized version
     static FloatTensor forward(Llama model, State state, int[] tokens, int position, boolean computeLogits) {
-        // a few convenience variables
         Configuration config = model.configuration();
         Weights weights = model.weights();
         int dim = config.dim;
         int headSize = config.headSize;
         int kvDim = (config.dim * config.numberOfKeyValueHeads) / config.numberOfHeads;
-        int kvMul = config.numberOfHeads / config.numberOfKeyValueHeads; // integer multiplier of the kv sharing in multiquery
+        int kvMul = config.numberOfHeads / config.numberOfKeyValueHeads;
         float sqrtHeadSize = (float) Math.sqrt(headSize);
         final int nTokens = tokens.length;
 
-        // copy the token embedding into x
-        Parallel.parallelFor(0, nTokens, t ->
-            weights.token_embedding_table.copyTo(tokens[t] * dim, state.x[t], 0, dim)
-        );
+        // Copy token embeddings using TornadoVM
+        float[] embeddings = new float[nTokens * dim];
+        for (int t = 0; t < nTokens; t++) {
+            weights.token_embedding_table.copyTo(tokens[t] * dim, state.x[t], 0, dim);
+        }
 
-        // forward all the layers
+        // Forward through layers
         for (int l = 0; l < config.numberOfLayers; l++) {
-            // attention rmsnorm
-            // rmsnorm(state.xb, state.x, weights.rms_att_weight[l], dim, config.rmsNormEps);
             final int curLayer = l;
-            Parallel.parallelFor(0, nTokens, t ->
-                rmsnorm(state.xb[t], state.x[t], weights.rms_att_weight[curLayer], dim, config.rmsNormEps)
-            );
 
-            // qkv matmuls for this position
-            weights.wq[l].matmul(nTokens, state.xb, state.q, dim, dim);
-            weights.wk[l].matmul(nTokens, state.xb, state.k, kvDim, dim);
-            weights.wv[l].matmul(nTokens, state.xb, state.v, kvDim, dim);
+            // Accelerated RMS norm
+            for (int t = 0; t < nTokens; t++) {
+                float[] xb = new float[dim];
+                float[] x = new float[dim];
+                float[] weight = new float[dim];
+                for (int i = 0; i < dim; i++) {
+                    x[i] = state.x[t].getFloat(i);
+                    weight[i] = weights.rms_att_weight[curLayer].get(i);
+                }
+                TornadoAccelerator.rmsnorm(xb, x, weight, dim, config.rmsNormEps);
+                for (int i = 0; i < dim; i++) {
+                    state.xb[t].setFloat(i, xb[i]);
+                }
+            }
 
-            // RoPE relative positional encoding: complex-valued rotate q and k in each head
+            // QKV matrix multiplications using TornadoVM
+            for (int t = 0; t < nTokens; t++) {
+                float[] xb = new float[dim];
+                float[] q = new float[dim];
+                float[] k = new float[kvDim];
+                float[] v = new float[kvDim];
+
+                for (int i = 0; i < dim; i++) {
+                    xb[i] = state.xb[t].getFloat(i);
+                }
+
+                TornadoAccelerator.matmul(xb, weights.wq[l].toArray(), q, 1, dim, dim);
+                TornadoAccelerator.matmul(xb, weights.wk[l].toArray(), k, 1, kvDim, dim);
+                TornadoAccelerator.matmul(xb, weights.wv[l].toArray(), v, 1, kvDim, dim);
+
+                for (int i = 0; i < dim; i++) {
+                    state.q[t].setFloat(i, q[i]);
+                }
+                for (int i = 0; i < kvDim; i++) {
+                    state.k[t].setFloat(i, k[i]);
+                    state.v[t].setFloat(i, v[i]);
+                }
+            }
+
+            // RoPE relative positional encoding
             Parallel.parallelFor(0, nTokens, t -> {
                 for (int i = 0; i < dim; i += 2) {
                     int head_dim = i % headSize;
                     float fcr = weights.freq_cis_real.get((position + t) * (headSize / 2) + (head_dim / 2));
                     float fci = weights.freq_cis_imag.get((position + t) * (headSize / 2) + (head_dim / 2));
-                    int rotn = i < kvDim ? 2 : 1; // how many vectors? 2 = q & k, 1 = q only
+                    int rotn = i < kvDim ? 2 : 1;
                     for (int vi = 0; vi < rotn; vi++) {
-                        FloatTensor vec = vi == 0 ? state.q[t] : state.k[t]; // the vector to rotate (query or key)
+                        FloatTensor vec = vi == 0 ? state.q[t] : state.k[t];
                         float v0 = vec.getFloat(i);
                         float v1 = vec.getFloat(i + 1);
                         vec.setFloat(i, v0 * fcr - v1 * fci);
@@ -1003,111 +1043,143 @@ record Llama(Configuration configuration, Tokenizer tokenizer, Weights weights) 
                 }
             });
 
-            // save key,value at this time step (position) to our kv cache
-            //int loff = l * config.seq_len * kvDim; // kv cache layer offset for convenience
+            // Save key/value cache
             Parallel.parallelFor(0, nTokens, t -> {
                 state.k[t].copyTo(0, state.keyCache[curLayer], (position + t) * kvDim, kvDim);
                 state.v[t].copyTo(0, state.valueCache[curLayer], (position + t) * kvDim, kvDim);
             });
 
-            // If the logits are not required, the attention and FFN of the last layer can be skipped entirely.
             if (!computeLogits && curLayer == config.numberOfLayers - 1) {
                 state.idxPrevBlock = nTokens - 1;
                 return null;
             }
 
-            // multihead attention. iterate over all heads
-            Parallel.parallelForLong(0, (long) nTokens * (long) config.numberOfHeads, ht -> {
-                int token = (int) (ht / config.numberOfHeads);
-                int h = (int) (ht % config.numberOfHeads);
-                // get the query vector for this head
-                // float* q = s.q + h * headSize;
-                int qOffset = h * headSize;
+            // Multi-head attention with TornadoVM acceleration
+            for (int t = 0; t < nTokens; t++) {
+                for (int h = 0; h < config.numberOfHeads; h++) {
+                    float[] scores = new float[position + t + 1];
+                    float[] qHead = new float[headSize];
+                    int qOffset = h * headSize;
 
-                // attention scores for this head
-                // float* att = s.att + h * config.seq_len;
-                int attOffset = h * config.contextLength;
+                    // Extract query head
+                    for (int i = 0; i < headSize; i++) {
+                        qHead[i] = state.q[t].getFloat(qOffset + i);
+                    }
 
-                // iterate over all timesteps, including the current one
-                for (int t = 0; t <= position + token; t++) {
-                    // get the key vector for this head and at this timestep
-                    // float* k = s.key_cache + loff + t * dim + h * headSize;
-                    int keyCacheOffset = /* loff + */ t * kvDim + (h / kvMul) * headSize;
-                    // calculate the attention score as the dot product of q and k
-                    float score = state.q[token].dot(qOffset, state.keyCache[curLayer], keyCacheOffset, headSize);
-                    score /= sqrtHeadSize;
-                    // save the score to the attention buffer
-                    state.att[token].setFloat(attOffset + t, score);
+                    // Calculate attention scores
+                    for (int ts = 0; ts <= position + t; ts++) {
+                        int keyCacheOffset = ts * kvDim + (h / kvMul) * headSize;
+                        float score = 0;
+                        for (int i = 0; i < headSize; i++) {
+                            score += qHead[i] * state.keyCache[curLayer].getFloat(keyCacheOffset + i);
+                        }
+                        scores[ts] = score / sqrtHeadSize;
+                    }
+
+                    // Softmax
+                    float max = Float.NEGATIVE_INFINITY;
+                    for (float score : scores) {
+                        max = Math.max(max, score);
+                    }
+                    float sum = 0;
+                    for (int i = 0; i < scores.length; i++) {
+                        scores[i] = (float) Math.exp(scores[i] - max);
+                        sum += scores[i];
+                    }
+                    for (int i = 0; i < scores.length; i++) {
+                        scores[i] /= sum;
+                    }
+
+                    // Weighted sum using TornadoVM
+                    float[] outHead = new float[headSize];
+                    for (int ts = 0; ts <= position + t; ts++) {
+                        int vOffset = ts * kvDim + (h / kvMul) * headSize;
+                        for (int i = 0; i < headSize; i++) {
+                            outHead[i] += scores[ts] * state.valueCache[curLayer].getFloat(vOffset + i);
+                        }
+                    }
+
+                    // Store result
+                    for (int i = 0; i < headSize; i++) {
+                        state.xb[t].setFloat(h * headSize + i, outHead[i]);
+                    }
+                }
+            }
+
+            // Output projection using TornadoVM
+            for (int t = 0; t < nTokens; t++) {
+                float[] xb = new float[dim];
+                float[] xb2 = new float[dim];
+                for (int i = 0; i < dim; i++) {
+                    xb[i] = state.xb[t].getFloat(i);
+                }
+                TornadoAccelerator.matmul(xb, weights.wo[l].toArray(), xb2, 1, dim, dim);
+                for (int i = 0; i < dim; i++) {
+                    state.xb2[t].setFloat(i, xb2[i]);
+                    state.x[t].setFloat(i, state.x[t].getFloat(i) + xb2[i]);
+                }
+            }
+
+            // FFN with TornadoVM
+            for (int t = 0; t < nTokens; t++) {
+                float[] xb = new float[dim];
+                float[] weight = new float[dim];
+                for (int i = 0; i < dim; i++) {
+                    xb[i] = state.x[t].getFloat(i);
+                    weight[i] = weights.rms_ffn_weight[curLayer].get(i);
+                }
+                TornadoAccelerator.rmsnorm(state.xb[t].toArray(), xb, weight, dim, config.rmsNormEps);
+            }
+
+            // Rest of FFN operations
+            for (int t = 0; t < nTokens; t++) {
+                float[] xb = new float[dim];
+                float[] hb = new float[config.hiddenDim];
+                float[] hb2 = new float[config.hiddenDim];
+
+                for (int i = 0; i < dim; i++) {
+                    xb[i] = state.xb[t].getFloat(i);
                 }
 
-                // softmax the scores to get attention weights, from 0..position inclusively
-                state.att[token].softmaxInPlace(attOffset, position + token + 1);
+                TornadoAccelerator.matmul(xb, weights.w1[l].toArray(), hb, 1, config.hiddenDim, dim);
+                TornadoAccelerator.matmul(xb, weights.w3[l].toArray(), hb2, 1, config.hiddenDim, dim);
 
-                // weighted sum of the values, store back into xb
-                // float* xb = s.xb + h * headSize;
-                int xbOffset = h * headSize;
-                // memset(xb, 0, headSize * sizeof(float));
-                state.xb[token].fillInPlace(xbOffset, headSize, 0f);
-
-                for (int t = 0; t <= position + token; t++) {
-                    // get the value vector for this head and at this timestep
-                    // float* v = s.value_cache + loff + t * dim + h * headSize;
-                    int vOffset = /* loff + */ t * kvDim + (h / kvMul) * headSize;
-                    // get the attention weight for this timestep
-                    float a = state.att[token].getFloat(attOffset + t);
-                    // accumulate the weighted value into xb
-                    state.xb[token].saxpyInPlace(xbOffset, state.valueCache[curLayer], vOffset, headSize, a);
+                // SwiGLU activation
+                for (int i = 0; i < config.hiddenDim; i++) {
+                    hb[i] = hb[i] / (1.0f + (float)Math.exp(-hb[i]));
+                    hb[i] *= hb2[i];
                 }
-            });
 
-            // final matmul to get the output of the attention
-            weights.wo[l].matmul(nTokens, state.xb, state.xb2, dim, dim);
+                // Final projection
+                float[] out = new float[dim];
+                TornadoAccelerator.matmul(hb, weights.w2[l].toArray(), out, 1, dim, config.hiddenDim);
 
-            // residual connection back into x
-            Parallel.parallelFor(0, nTokens, t -> {
-                state.x[t].addInPlace(state.xb2[t]);
-            });
-
-            // ffn rmsnorm
-            Parallel.parallelFor(0, nTokens, t -> {
-                rmsnorm(state.xb[t], state.x[t], weights.rms_ffn_weight[curLayer], dim, config.rmsNormEps);
-            });
-
-            // Now for FFN in PyTorch we have: self.w2(F.silu(self.w1(x)) * self.w3(x))
-            // first calculate self.w1(x) and self.w3(x)
-            weights.w1[l].matmul(nTokens, state.xb, state.hb, config.hiddenDim, dim);
-            weights.w3[l].matmul(nTokens, state.xb, state.hb2, config.hiddenDim, dim);
-
-            // SwiGLU non-linearity
-            // silu(x)=x*σ(x), where σ(x) is the logistic sigmoid
-            Parallel.parallelFor(0, nTokens, t -> {
-                state.hb[t].mapInPlace(value -> value / (float) (1.0 + Math.exp(-value)));
-            });
-
-            // elementwise multiply with w3(x)
-            Parallel.parallelFor(0, nTokens, t -> {
-                state.hb[t].multiplyInPlace(state.hb2[t]);
-            });
-
-            // final matmul to get the output of the ffn
-            weights.w2[l].matmul(nTokens, state.hb, state.xb, dim, config.hiddenDim);
-
-            // residual connection
-            Parallel.parallelFor(0, nTokens, t -> {
-                state.x[t].addInPlace(state.xb[t]);
-            });
+                for (int i = 0; i < dim; i++) {
+                    state.x[t].setFloat(i, state.x[t].getFloat(i) + out[i]);
+                }
+            }
         }
 
-        // final rmsnorm
-        Parallel.parallelFor(0, nTokens, t -> {
-            rmsnorm(state.x[t], state.x[t], weights.rms_final_weight, dim, config.rmsNormEps);
-        });
+        // Final layer norm
+        float[] x = new float[dim];
+        float[] weight = new float[dim];
+        for (int i = 0; i < dim; i++) {
+            x[i] = state.x[nTokens-1].getFloat(i);
+            weight[i] = weights.rms_final_weight.get(i);
+        }
+        TornadoAccelerator.rmsnorm(state.x[nTokens-1].toArray(), x, weight, dim, config.rmsNormEps);
 
-        // classifier into logits
-        weights.wcls.matmul(state.x[nTokens - 1], state.logits, config.vocabularySize, dim);
+        // Final classifier
+        if (computeLogits) {
+            float[] logits = new float[config.vocabularySize];
+            TornadoAccelerator.matmul(state.x[nTokens-1].toArray(), weights.wcls.toArray(), logits, 1, config.vocabularySize, dim);
+            for (int i = 0; i < config.vocabularySize; i++) {
+                state.logits.setFloat(i, logits[i]);
+            }
+        }
+
         state.idxPrevBlock = nTokens - 1;
-
-        return state.logits;
+        return computeLogits ? state.logits : null;
     }
 
     /**
@@ -1736,6 +1808,8 @@ abstract class FloatTensor {
         }
         return this;
     }
+
+    abstract float[] toArray();
 }
 
 /**
@@ -1799,6 +1873,15 @@ final class Q4_0FloatTensor extends FloatTensor {
         } else {
             return FloatTensor.scalarDot(this, thisOffset, that, thatOffset, size);
         }
+    }
+
+    @Override
+    float[] toArray() {
+        float[] result = new float[size];
+        for (int i = 0; i < size; i++) {
+            result[i] = getFloat(i);
+        }
+        return result;
     }
 
     private static float vectorDot(Q4_0FloatTensor thiz, int thisOffset, ArrayFloatTensor that, int thatOffset, int size) {
@@ -1913,6 +1996,15 @@ final class Q8_0FloatTensor extends FloatTensor {
         }
     }
 
+    @Override
+    float[] toArray() {
+        float[] result = new float[size];
+        for (int i = 0; i < size; i++) {
+            result[i] = getFloat(i);
+        }
+        return result;
+    }
+
     private static float vectorDot(Q8_0FloatTensor thiz, int thisOffset, ArrayFloatTensor that, int thatOffset, int size) {
         float result = 0f;
         int j = 0;
@@ -2009,6 +2101,11 @@ final class ArrayFloatTensor extends FloatTensor {
     public FloatTensor fillInPlace(int thisOffset, int size, float value) {
         Arrays.fill(values, thisOffset, thisOffset + size, value);
         return this;
+    }
+
+    @Override
+    float[] toArray() {
+        return values;
     }
 
     @Override
@@ -2328,6 +2425,86 @@ final class AOT {
             Map<String, GGMLTensorEntry> tensorEntries = GGUF.loadTensors(fileChannel, preLoaded.tensorDataOffset(), preLoaded.tensorInfos());
             Llama.Weights weights = ModelLoader.loadWeights(tensorEntries, baseModel.configuration());
             return new Llama(baseModel.configuration().withContextLength(contextLength), baseModel.tokenizer(), weights);
+        }
+    }
+}
+
+class TornadoAccelerator {
+
+    /**
+     * Accelerated matrix multiplication using TornadoVM
+     */
+    public static void matmul(float[] a, float[] b, float[] c, int m, int n, int k) {
+        TaskGraph taskGraph = new TaskGraph("matmul")
+                .transferToDevice(DataTransferMode.FIRST_EXECUTION, a, b)
+                .task("t0", TornadoAccelerator::matmulKernel, a, b, c, m, n, k)
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, c);
+
+        ImmutableTaskGraph immutableTaskGraph = taskGraph.snapshot();
+
+        try (TornadoExecutionPlan executionPlan = new TornadoExecutionPlan(immutableTaskGraph)) {
+            executionPlan.execute();
+        } catch (TornadoExecutionPlanException e) {
+            throw new RuntimeException("Failed to execute matrix multiplication", e);
+        }
+    }
+
+    private static void matmulKernel(float[] a, float[] b, float[] c, int m, int n, int k) {
+        for (@uk.ac.manchester.tornado.api.annotations.Parallel int i = 0; i < m; i++) {
+            for (@uk.ac.manchester.tornado.api.annotations.Parallel int j = 0; j < n; j++) {
+                float sum = 0.0f;
+                for (int l = 0; l < k; l++) {
+                    sum += a[i * k + l] * b[l * n + j];
+                }
+                c[i * n + j] = sum;
+            }
+        }
+    }
+
+    /**
+     * Accelerated RMS normalization using TornadoVM
+     */
+    public static void rmsnorm(float[] out, float[] x, float[] weight, int size, float eps) {
+        System.out.println("RMS Normalization Input Parameters:");
+                System.out.println("Output array length: " + out.length);
+                System.out.println("Input array x length: " + x.length);
+                System.out.println("Weight array length: " + weight.length);
+                System.out.println("Size: " + size);
+                System.out.println("Epsilon: " + eps);
+
+                // Print first few elements of arrays if they exist
+                if (x.length > 0) {
+                    System.out.println("First element of x: " + x[0]);
+                }
+                if (weight.length > 0) {
+                    System.out.println("First element of weight: " + weight[0]);
+                }
+
+        TaskGraph taskGraph = new TaskGraph("rmsnorm")
+                .transferToDevice(DataTransferMode.FIRST_EXECUTION, x, weight)
+                .task("t0", TornadoAccelerator::rmsnormKernel, out, x, weight, size, eps)
+                .transferToHost(DataTransferMode.EVERY_EXECUTION, out);
+
+        ImmutableTaskGraph immutableTaskGraph = taskGraph.snapshot();
+
+        try (TornadoExecutionPlan executionPlan = new TornadoExecutionPlan(immutableTaskGraph)) {
+            executionPlan.execute();
+        } catch (TornadoExecutionPlanException e) {
+            throw new RuntimeException("Failed to execute RMS normalization", e);
+        }
+
+    }
+
+    private static void rmsnormKernel(float[] out, float[] x, float[] weight, int size, float eps) {
+        float ss = 0.0f;
+        for (@uk.ac.manchester.tornado.api.annotations.Parallel int i = 0; i < size; i++) {
+            ss += x[i] * x[i];
+        }
+        ss = ss / size + eps;
+        ss = (float)(1.0f / Math.sqrt(ss));
+
+        for (@uk.ac.manchester.tornado.api.annotations.Parallel int i = 0; i < size; i++) {
+            out[i] = weight[i] * (ss * x[i]);
         }
     }
 }
